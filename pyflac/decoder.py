@@ -154,18 +154,23 @@ class StreamDecoder(_Decoder):
         DecoderInitException: If initialisation of the decoder fails
     """
     def __init__(self,
-                 write_callback: Callable[[np.ndarray, int, int, int], None]):
+                 write_callback: Callable[[np.ndarray, int, int, int], None],
+                 seek_callback: Callable[[int], None] = None,
+                 tell_callback: Callable[[], int] = None,
+                 ):
         super().__init__()
 
         self._done = False
         self._buffer = deque()
         self.write_callback = write_callback
+        self.seek_callback = seek_callback
+        self.tell_callback = tell_callback
 
         rc = _lib.FLAC__stream_decoder_init_stream(
             self._decoder,
             _lib._read_callback,
-            _ffi.NULL,
-            _ffi.NULL,
+            _lib._seek_callback if self.seek_callback else _ffi.NULL,
+            _lib._tell_callback if self.tell_callback else _ffi.NULL,
             _ffi.NULL,
             _ffi.NULL,
             _lib._write_callback,
@@ -359,14 +364,18 @@ def _read_callback(_decoder,
 def _seek_callback(_decoder,
                    absolute_byte_offset,
                    client_data):
-    raise NotImplementedError
+    decoder = _ffi.from_handle(client_data)
+    decoder.seek_callback(absolute_byte_offset)
+    return _lib.FLAC__STREAM_DECODER_SEEK_STATUS_OK
 
 
 @_ffi.def_extern()
 def _tell_callback(_decoder,
                    absolute_byte_offset,
                    client_data):
-    raise NotImplementedError
+    decoder = _ffi.from_handle(client_data)
+    absolute_byte_offset[0] = decoder.tell_callback()
+    return _lib.FLAC__STREAM_DECODER_TELL_STATUS_OK
 
 
 @_ffi.def_extern()
