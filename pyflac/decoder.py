@@ -154,25 +154,31 @@ class StreamDecoder(_Decoder):
         DecoderInitException: If initialisation of the decoder fails
     """
     def __init__(self,
+                 read_callback: Callable[[int], bytes],
                  write_callback: Callable[[np.ndarray, int, int, int], None],
                  seek_callback: Callable[[int], None] = None,
                  tell_callback: Callable[[], int] = None,
+                 length_callback: Callable[[], int] = None,
+                 eof_callback: Callable[[], bool] = None,
                  ):
         super().__init__()
 
         self._done = False
         self._buffer = deque()
+        self.read_callback = read_callback
         self.write_callback = write_callback
         self.seek_callback = seek_callback
         self.tell_callback = tell_callback
+        self.length_callback = length_callback
+        self.eof_callback = eof_callback
 
         rc = _lib.FLAC__stream_decoder_init_stream(
             self._decoder,
             _lib._read_callback,
             _lib._seek_callback if self.seek_callback else _ffi.NULL,
             _lib._tell_callback if self.tell_callback else _ffi.NULL,
-            _ffi.NULL,
-            _ffi.NULL,
+            _lib._length_callback if self.length_callback else _ffi.NULL,
+            _lib._eof_callback if self.eof_callback else _ffi.NULL,
             _lib._write_callback,
             _ffi.NULL,
             _lib._error_callback,
@@ -181,59 +187,14 @@ class StreamDecoder(_Decoder):
         if rc != _lib.FLAC__STREAM_DECODER_INIT_STATUS_OK:
             raise DecoderInitException(rc)
 
-        self._thread = threading.Thread(target=self._process)
-        self._thread.daemon = True
-        self._thread.start()
-
     # -- Processing
 
-    def _process(self):
+    def process(self):
         """
-        Internal function to instruct the decoder to process until the end of
-        the stream. This should be run in a separate thread.
+        Kick off the encoding
         """
         if not _lib.FLAC__stream_decoder_process_until_end_of_stream(self._decoder):
             self._error = 'A fatal read, write, or memory allocation error occurred'
-
-    def process(self, data: bytes):
-        """
-        Instruct the decoder to process some data.
-
-        Note: This is a non-blocking function, data is processed in
-        a background thread.
-
-        Args:
-            data (bytes): Bytes of FLAC data
-        """
-        self._buffer.append(data)
-
-    def finish(self):
-        """
-        Finish the decoding process.
-
-        This must be called at the end of the decoding process.
-
-        Flushes the decoding buffer, closes the processing thread, releases resources, resets the decoder
-        settings to their defaults, and returns the decoder state to `DecoderState.UNINITIALIZED`.
-
-        Raises:
-            DecoderProcessException: if any fatal read, write, or memory allocation
-                error occurred.
-        """
-        # --------------------------------------------------------------
-        # Finish processing what's in the buffer if there are no errors
-        # --------------------------------------------------------------
-        while self._thread.is_alive() and self._error is None and len(self._buffer) > 0:
-            time.sleep(0.01)
-
-        # --------------------------------------------------------------
-        # Instruct the decoder to finish up and wait until it is done
-        # --------------------------------------------------------------
-        self._done = True
-        super().finish()
-        self._thread.join(timeout=3)
-        if self._error:
-            raise DecoderProcessException(self._error)
 
 
 class FileDecoder(_Decoder):
@@ -326,33 +287,20 @@ def _read_callback(_decoder,
         # ----------------------------------------------------------
         return _lib.FLAC__STREAM_DECODER_READ_STATUS_ABORT
 
-    if decoder._done:
-        # ----------------------------------------------------------
-        # The end of the stream has been instructed by a call to
-        # finish.
-        # ----------------------------------------------------------
-        num_bytes[0] = 0
-        return _lib.FLAC__STREAM_DECODER_READ_STATUS_END_OF_STREAM
-
     maximum_bytes = int(num_bytes[0])
-    while len(decoder._buffer) == 0:
-        # ----------------------------------------------------------
-        # Wait until there is something in the buffer
-        # ----------------------------------------------------------
-        time.sleep(0.01)
 
     # --------------------------------------------------------------
     # Ensure only the maximum bytes or less is taken from
     # the thread safe queue.
     # --------------------------------------------------------------
-    data = bytes()
-    if len(decoder._buffer[0]) <= maximum_bytes:
-        data = decoder._buffer.popleft()
-        maximum_bytes -= len(data)
+    data = decoder.read_callback(maximum_bytes)
 
-    if len(decoder._buffer) > 0 and len(decoder._buffer[0]) > maximum_bytes:
-        data += decoder._buffer[0][0:maximum_bytes]
-        decoder._buffer[0] = decoder._buffer[0][maximum_bytes:]
+    if not data or len(data) == 0:
+        num_bytes[0] = 0
+        return _lib.FLAC__STREAM_DECODER_READ_STATUS_END_OF_STREAM
+
+    if len(data) > maximum_bytes:
+        raise RuntimeError('Callback supplied too much data.')
 
     actual_bytes = len(data)
     num_bytes[0] = actual_bytes
@@ -382,13 +330,16 @@ def _tell_callback(_decoder,
 def _length_callback(_decoder,
                      stream_length,
                      client_data):
-    raise NotImplementedError
+    decoder = _ffi.from_handle(client_data)
+    stream_length[0] = decoder.length_callback()
+    return _lib.FLAC__STREAM_DECODER_LENGTH_STATUS_OK
 
 
 @_ffi.def_extern()
 def _eof_callback(_decoder,
                   client_data):
-    raise NotImplementedError
+    decoder = _ffi.from_handle(client_data)
+    return decoder.eof_callback()
 
 
 @_ffi.def_extern(error=_lib.FLAC__STREAM_DECODER_WRITE_STATUS_ABORT)
